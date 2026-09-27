@@ -4,8 +4,10 @@ import { getSql } from '../../../../lib/db.js';
 export const runtime = 'nodejs';
 
 const SUPPORTED_EVENTS = new Set([
+  'transaction.completed',
   'subscription.created',
-  'subscription.updated'
+  'subscription.updated',
+  'subscription.canceled'
 ]);
 
 function stringOrNull(value) {
@@ -15,9 +17,7 @@ function stringOrNull(value) {
 }
 
 function dateOrNull(value) {
-  if (!value) {
-    return null;
-  }
+  if (!value) return null;
 
   if (value instanceof Date) {
     return value.toISOString();
@@ -45,9 +45,7 @@ export async function POST(request) {
   if (!webhookSecret) {
     return new Response(
       'Webhook secret is not configured.',
-      {
-        status: 503
-      }
+      { status: 503 }
     );
   }
 
@@ -57,16 +55,10 @@ export async function POST(request) {
   if (!signature) {
     return new Response(
       'Missing Paddle-Signature header.',
-      {
-        status: 400
-      }
+      { status: 400 }
     );
   }
 
-  /*
-   * Important:
-   * Signature verification must use the exact raw request body.
-   */
   const rawBody = await request.text();
 
   let event;
@@ -89,16 +81,10 @@ export async function POST(request) {
 
     return new Response(
       'Invalid webhook signature.',
-      {
-        status: 400
-      }
+      { status: 400 }
     );
   }
 
-  /*
-   * Return success for valid Paddle events that LaunchGuard
-   * does not currently need.
-   */
   if (!SUPPORTED_EVENTS.has(event.eventType)) {
     return Response.json({
       ok: true,
@@ -106,6 +92,35 @@ export async function POST(request) {
       eventType: event.eventType
     });
   }
+
+  /*
+   * A completed transaction confirms that Paddle
+   * successfully completed the purchase.
+   *
+   * For LaunchGuard subscriptions, entitlement state itself
+   * is mirrored from subscription events below.
+   */
+  if (event.eventType === 'transaction.completed') {
+    const transaction = event.data;
+
+    console.log(
+      'Paddle transaction completed:',
+      transaction.id
+    );
+
+    return Response.json({
+      ok: true,
+      eventType: event.eventType
+    });
+  }
+
+  /*
+   * Remaining supported events are subscription events:
+   *
+   * subscription.created
+   * subscription.updated
+   * subscription.canceled
+   */
 
   const subscription = event.data;
 
@@ -125,10 +140,6 @@ export async function POST(request) {
       firstItem?.price?.productId
     );
 
-  /*
-   * Later the LaunchGuard checkout will send a random
-   * installation ID through Paddle custom data.
-   */
   const installationId =
     stringOrNull(
       subscription.customData?.installation_id
@@ -144,6 +155,12 @@ export async function POST(request) {
       subscription.currentBillingPeriod?.endsAt
     );
 
+  /*
+   * canceled => false
+   * paused => false
+   *
+   * active/trialing/past_due currently keep access.
+   */
   const entitled =
     entitlementForStatus(
       subscription.status
@@ -166,12 +183,6 @@ export async function POST(request) {
   try {
     const sql = getSql();
 
-    /*
-     * Idempotent upsert:
-     *
-     * - duplicate Paddle events are safe
-     * - an older webhook cannot overwrite newer state
-     */
     await sql`
       INSERT INTO paddle_subscriptions (
         subscription_id,
@@ -189,6 +200,7 @@ export async function POST(request) {
         event_occurred_at,
         updated_at
       )
+
       VALUES (
         ${subscription.id},
         ${subscription.customerId},
@@ -259,7 +271,9 @@ export async function POST(request) {
 
     return Response.json({
       ok: true,
-      eventType: event.eventType
+      eventType: event.eventType,
+      status: subscription.status,
+      entitled
     });
 
   } catch (error) {
@@ -272,9 +286,7 @@ export async function POST(request) {
 
     return new Response(
       'Webhook processing failed.',
-      {
-        status: 500
-      }
+      { status: 500 }
     );
   }
 }
