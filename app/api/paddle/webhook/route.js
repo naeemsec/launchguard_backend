@@ -1,76 +1,186 @@
-import { getPaddle } from '../../../../lib/paddle.js';
-import { getSql } from '../../../../lib/db.js';
+// ==================================
+// app/api/paddle/webhook/route.js
+// // ==================================
+import {
+  getPaddle
+} from '../../../../lib/paddle.js';
 
-export const runtime = 'nodejs';
+import {
+  getSql
+} from '../../../../lib/db.js';
 
-const SUPPORTED_EVENTS = new Set([
-  'transaction.completed',
-  'subscription.created',
-  'subscription.updated',
-  'subscription.canceled'
-]);
 
-function stringOrNull(value) {
-  return typeof value === 'string' && value.length > 0
+export const runtime =
+  'nodejs';
+
+
+const SUPPORTED_EVENTS =
+  new Set([
+    'transaction.completed',
+    'subscription.created',
+    'subscription.updated',
+    'subscription.canceled'
+  ]);
+
+
+function stringOrNull(
+  value
+) {
+  return (
+    typeof value ===
+      'string' &&
+    value.length > 0
+  )
     ? value
     : null;
 }
 
-function dateOrNull(value) {
-  if (!value) return null;
 
-  if (value instanceof Date) {
-    return value.toISOString();
+function dateOrNull(
+  value
+) {
+  if (!value) {
+    return null;
   }
 
-  if (typeof value === 'string') {
+
+  if (
+    value instanceof Date
+  ) {
+    return value
+      .toISOString();
+  }
+
+
+  if (
+    typeof value ===
+      'string'
+  ) {
     return value;
   }
+
 
   return null;
 }
 
-function entitlementForStatus(status) {
-  return [
-    'active',
-    'trialing',
-    'past_due'
-  ].includes(status);
+
+function validInstallationId(
+  value
+) {
+  return (
+    typeof value ===
+      'string' &&
+    /^lg_[a-f0-9]{64}$/
+      .test(value)
+  );
 }
 
-export async function POST(request) {
+
+function allowedPriceIds() {
+  const ids =
+    [
+      process.env
+        .NEXT_PUBLIC_PADDLE_MONTHLY_PRICE_ID,
+
+      process.env
+        .NEXT_PUBLIC_PADDLE_ANNUAL_PRICE_ID
+    ]
+      .filter(
+        value =>
+          /^pri_[a-z0-9]+$/i
+            .test(
+              String(
+                value || ''
+              )
+            )
+      );
+
+
+  if (
+    ids.length !== 2
+  ) {
+    throw new Error(
+      'LaunchGuard Paddle prices are not configured.'
+    );
+  }
+
+
+  return new Set(ids);
+}
+
+
+function entitlementForStatus(
+  status
+) {
+  /*
+   * Strict access policy.
+   *
+   * No Pro while past_due.
+   */
+  return (
+    status === 'active' ||
+    status === 'trialing'
+  );
+}
+
+
+export async function POST(
+  request
+) {
   const webhookSecret =
-    process.env.PADDLE_WEBHOOK_SECRET;
+    process.env
+      .PADDLE_WEBHOOK_SECRET;
+
 
   if (!webhookSecret) {
     return new Response(
       'Webhook secret is not configured.',
-      { status: 503 }
+      {
+        status: 503
+      }
     );
   }
 
+
   const signature =
-    request.headers.get('paddle-signature') || '';
+    request.headers.get(
+      'paddle-signature'
+    ) || '';
+
 
   if (!signature) {
     return new Response(
       'Missing Paddle-Signature header.',
-      { status: 400 }
+      {
+        status: 400
+      }
     );
   }
 
-  const rawBody = await request.text();
+
+  /*
+   * Signature verification needs the exact raw body.
+   */
+  const rawBody =
+    await request.text();
+
 
   let event;
 
-  try {
-    const paddle = getPaddle();
 
-    event = await paddle.webhooks.unmarshal(
-      rawBody,
-      webhookSecret,
-      signature
-    );
+  try {
+    const paddle =
+      getPaddle();
+
+
+    event =
+      await paddle.webhooks
+        .unmarshal(
+          rawBody,
+          webhookSecret,
+          signature
+        );
+
   } catch (error) {
     console.error(
       'Rejected Paddle webhook:',
@@ -79,127 +189,212 @@ export async function POST(request) {
         : 'Unknown verification error'
     );
 
+
     return new Response(
       'Invalid webhook signature.',
-      { status: 400 }
+      {
+        status: 400
+      }
     );
   }
 
-  if (!SUPPORTED_EVENTS.has(event.eventType)) {
+
+  if (
+    !SUPPORTED_EVENTS.has(
+      event.eventType
+    )
+  ) {
     return Response.json({
       ok: true,
       ignored: true,
-      eventType: event.eventType
+      eventType:
+        event.eventType
     });
   }
 
-  /*
-   * A completed transaction confirms that Paddle
-   * successfully completed the purchase.
-   *
-   * For LaunchGuard subscriptions, entitlement state itself
-   * is mirrored from subscription events below.
-   */
-  if (event.eventType === 'transaction.completed') {
-    const transaction = event.data;
 
-    console.log(
-      'Paddle transaction completed:',
-      transaction.id
-    );
-
+  if (
+    event.eventType ===
+      'transaction.completed'
+  ) {
     return Response.json({
       ok: true,
-      eventType: event.eventType
+      eventType:
+        event.eventType
     });
   }
 
+
+  const subscription =
+    event.data;
+
+
+  const allowedPrices =
+    allowedPriceIds();
+
+
+  const items =
+    Array.isArray(
+      subscription.items
+    )
+      ? subscription.items
+      : [];
+
+
   /*
-   * Remaining supported events are subscription events:
-   *
-   * subscription.created
-   * subscription.updated
-   * subscription.canceled
+   * Only LaunchGuard Pro's configured monthly/annual
+   * Paddle prices are allowed to grant entitlement.
    */
+  const matchedItem =
+    items.find(
+      item =>
+        allowedPrices.has(
+          item?.price?.id
+        )
+    ) || null;
 
-  const subscription = event.data;
-
-  const firstItem =
-    Array.isArray(subscription.items) &&
-    subscription.items.length > 0
-      ? subscription.items[0]
-      : null;
 
   const priceId =
     stringOrNull(
-      firstItem?.price?.id
+      matchedItem
+        ?.price
+        ?.id
     );
+
 
   const productId =
     stringOrNull(
-      firstItem?.price?.productId
+      matchedItem
+        ?.price
+        ?.productId
     );
 
-  const installationId =
+
+  const requestedInstallationId =
     stringOrNull(
-      subscription.customData?.installation_id
+      subscription
+        .customData
+        ?.installation_id
     );
+
+
+  const installationId =
+    validInstallationId(
+      requestedInstallationId
+    )
+      ? requestedInstallationId
+      : null;
+
 
   const periodStart =
     dateOrNull(
-      subscription.currentBillingPeriod?.startsAt
+      subscription
+        .currentBillingPeriod
+        ?.startsAt
     );
+
 
   const periodEnd =
     dateOrNull(
-      subscription.currentBillingPeriod?.endsAt
+      subscription
+        .currentBillingPeriod
+        ?.endsAt
     );
 
-  /*
-   * canceled => false
-   * paused => false
-   *
-   * active/trialing/past_due currently keep access.
-   */
-  const entitled =
-    entitlementForStatus(
-      subscription.status
-    );
 
   const scheduledChangeJson =
     JSON.stringify(
-      subscription.scheduledChange ?? null
+      subscription
+        .scheduledChange ??
+      null
     );
+
 
   const customDataJson =
     JSON.stringify(
-      subscription.customData ?? null
+      subscription
+        .customData ??
+      null
     );
 
+
   const occurredAt =
-    dateOrNull(event.occurredAt) ||
-    new Date().toISOString();
+    dateOrNull(
+      event.occurredAt
+    ) ||
+    new Date()
+      .toISOString();
+
 
   try {
-    const sql = getSql();
+    const sql =
+      getSql();
+
+
+    /*
+     * Paddle custom data alone is NOT enough.
+     *
+     * The installation must have registered its private
+     * secret with our backend before checkout.
+     */
+    let registered =
+      false;
+
+
+    if (
+      installationId
+    ) {
+      const registrations =
+        await sql`
+          SELECT
+            installation_id
+
+          FROM
+            installation_registrations
+
+          WHERE
+            installation_id =
+            ${installationId}
+
+          LIMIT 1
+        `;
+
+
+      registered =
+        registrations.length ===
+        1;
+    }
+
+
+    const entitled =
+      Boolean(
+        matchedItem &&
+        installationId &&
+        registered &&
+        entitlementForStatus(
+          subscription.status
+        )
+      );
+
 
     await sql`
-      INSERT INTO paddle_subscriptions (
-        subscription_id,
-        customer_id,
-        status,
-        entitled,
-        price_id,
-        product_id,
-        installation_id,
-        current_period_start,
-        current_period_end,
-        scheduled_change,
-        custom_data,
-        last_event_id,
-        event_occurred_at,
-        updated_at
-      )
+      INSERT INTO
+        paddle_subscriptions (
+          subscription_id,
+          customer_id,
+          status,
+          entitled,
+          price_id,
+          product_id,
+          installation_id,
+          current_period_start,
+          current_period_end,
+          scheduled_change,
+          custom_data,
+          last_event_id,
+          event_occurred_at,
+          updated_at
+        )
 
       VALUES (
         ${subscription.id},
@@ -211,14 +406,22 @@ export async function POST(request) {
         ${installationId},
         ${periodStart},
         ${periodEnd},
-        CAST(${scheduledChangeJson} AS jsonb),
-        CAST(${customDataJson} AS jsonb),
+        CAST(
+          ${scheduledChangeJson}
+          AS jsonb
+        ),
+        CAST(
+          ${customDataJson}
+          AS jsonb
+        ),
         ${event.eventId},
         ${occurredAt},
         NOW()
       )
 
-      ON CONFLICT (subscription_id)
+      ON CONFLICT (
+        subscription_id
+      )
 
       DO UPDATE SET
         customer_id =
@@ -239,40 +442,55 @@ export async function POST(request) {
         installation_id =
           COALESCE(
             EXCLUDED.installation_id,
-            paddle_subscriptions.installation_id
+            paddle_subscriptions
+              .installation_id
           ),
 
         current_period_start =
-          EXCLUDED.current_period_start,
+          EXCLUDED
+            .current_period_start,
 
         current_period_end =
-          EXCLUDED.current_period_end,
+          EXCLUDED
+            .current_period_end,
 
         scheduled_change =
-          EXCLUDED.scheduled_change,
+          EXCLUDED
+            .scheduled_change,
 
         custom_data =
-          EXCLUDED.custom_data,
+          EXCLUDED
+            .custom_data,
 
         last_event_id =
-          EXCLUDED.last_event_id,
+          EXCLUDED
+            .last_event_id,
 
         event_occurred_at =
-          EXCLUDED.event_occurred_at,
+          EXCLUDED
+            .event_occurred_at,
 
         updated_at =
           NOW()
 
       WHERE
-        paddle_subscriptions.event_occurred_at
+        paddle_subscriptions
+          .event_occurred_at
         <=
-        EXCLUDED.event_occurred_at
+        EXCLUDED
+          .event_occurred_at
     `;
+
 
     return Response.json({
       ok: true,
-      eventType: event.eventType,
-      status: subscription.status,
+
+      eventType:
+        event.eventType,
+
+      status:
+        subscription.status,
+
       entitled
     });
 
@@ -284,9 +502,12 @@ export async function POST(request) {
         : 'Unknown database error'
     );
 
+
     return new Response(
       'Webhook processing failed.',
-      { status: 500 }
+      {
+        status: 500
+      }
     );
   }
 }
