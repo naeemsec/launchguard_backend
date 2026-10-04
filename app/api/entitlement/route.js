@@ -52,7 +52,7 @@ function hashSecret(
       'string' ||
     key.length < 32
   ) {
-    throw new Error(
+    throw Error(
       'INSTALLATION_HMAC_KEY is not configured.'
     );
   }
@@ -66,40 +66,21 @@ function hashSecret(
       secret,
       'utf8'
     )
-    .digest('hex');
+    .digest(
+      'hex'
+    );
 }
 
 
 function sameHash(
-  a,
-  b
+  first,
+  second
 ) {
   if (
-    typeof a !==
+    typeof first !==
       'string' ||
-    typeof b !==
+    typeof second !==
       'string' ||
-    a.length !== b.length
-  ) {
-    return false;
-  }
-
-
-  const first =
-    Buffer.from(
-      a,
-      'hex'
-    );
-
-
-  const second =
-    Buffer.from(
-      b,
-      'hex'
-    );
-
-
-  if (
     first.length !==
       second.length
   ) {
@@ -107,56 +88,104 @@ function sameHash(
   }
 
 
+  const a =
+    Buffer.from(
+      first,
+      'hex'
+    );
+
+
+  const b =
+    Buffer.from(
+      second,
+      'hex'
+    );
+
+
+  if (
+    a.length !==
+      b.length
+  ) {
+    return false;
+  }
+
+
   return timingSafeEqual(
-    first,
-    second
+    a,
+    b
   );
 }
 
 
-function allowedPriceIds() {
-  const ids =
-    [
-      process.env
-        .NEXT_PUBLIC_PADDLE_MONTHLY_PRICE_ID,
+function paddlePrices() {
+  const monthly =
+    process.env
+      .NEXT_PUBLIC_PADDLE_MONTHLY_PRICE_ID;
 
-      process.env
-        .NEXT_PUBLIC_PADDLE_ANNUAL_PRICE_ID
-    ]
-      .filter(
-        value =>
-          /^pri_[a-z0-9]+$/i
-            .test(
-              String(
-                value || ''
-              )
-            )
-      );
+
+  const annual =
+    process.env
+      .NEXT_PUBLIC_PADDLE_ANNUAL_PRICE_ID;
 
 
   if (
-    ids.length !== 2
+    !/^pri_[a-z0-9]+$/i
+      .test(
+        String(
+          monthly || ''
+        )
+      ) ||
+    !/^pri_[a-z0-9]+$/i
+      .test(
+        String(
+          annual || ''
+        )
+      ) ||
+    monthly === annual
   ) {
-    throw new Error(
+    throw Error(
       'LaunchGuard Paddle prices are not configured.'
     );
   }
 
 
-  return new Set(ids);
+  return {
+    monthly,
+    annual,
+
+    allowed:
+      new Set([
+        monthly,
+        annual
+      ])
+  };
 }
 
 
 function statusAllowsAccess(
   status
 ) {
-  /*
-   * Strict mode:
-   * past_due does NOT grant Pro.
-   */
   return (
     status === 'active' ||
     status === 'trialing'
+  );
+}
+
+
+function noStore(
+  body,
+  status = 200
+) {
+  return Response.json(
+    body,
+    {
+      status,
+
+      headers: {
+        'Cache-Control':
+          'no-store'
+      }
+    }
   );
 }
 
@@ -172,14 +201,12 @@ export async function POST(
       await request.json();
 
   } catch {
-    return Response.json(
+    return noStore(
       {
         error:
           'Invalid JSON body.'
       },
-      {
-        status: 400
-      }
+      400
     );
   }
 
@@ -200,14 +227,12 @@ export async function POST(
       installationSecret
     )
   ) {
-    return Response.json(
+    return noStore(
       {
         error:
           'Invalid installation identity.'
       },
-      {
-        status: 400
-      }
+      400
     );
   }
 
@@ -227,29 +252,48 @@ export async function POST(
 
         WHERE
           installation_id =
-          ${installationId}
+            ${installationId}
 
         LIMIT 1
       `;
 
 
+    /*
+     * Free installation that has not opened checkout yet.
+     *
+     * This is not an authentication failure.
+     */
     if (
-      registrations.length !==
-      1
+      registrations.length === 0
     ) {
-      return Response.json(
-        {
-          error:
-            'Installation verification failed.'
-        },
-        {
-          status: 401,
-          headers: {
-            'Cache-Control':
-              'no-store'
-          }
-        }
-      );
+      return noStore({
+        entitled:
+          false,
+
+        hasSubscription:
+          false,
+
+        status:
+          'not_registered',
+
+        plan:
+          null,
+
+        priceId:
+          null,
+
+        productId:
+          null,
+
+        currentPeriodStart:
+          null,
+
+        currentPeriodEnd:
+          null,
+
+        scheduledChange:
+          null
+      });
     }
 
 
@@ -260,24 +304,19 @@ export async function POST(
 
 
     if (
+      registrations.length !== 1 ||
       !sameHash(
         registrations[0]
           .secret_hash,
         expectedHash
       )
     ) {
-      return Response.json(
+      return noStore(
         {
           error:
             'Installation verification failed.'
         },
-        {
-          status: 401,
-          headers: {
-            'Cache-Control':
-              'no-store'
-          }
-        }
+        401
       );
     }
 
@@ -299,11 +338,14 @@ export async function POST(
     const subscriptions =
       await sql`
         SELECT
+          subscription_id,
           status,
           entitled,
           price_id,
           product_id,
+          current_period_start,
           current_period_end,
+          scheduled_change,
           event_occurred_at
 
         FROM
@@ -311,7 +353,7 @@ export async function POST(
 
         WHERE
           installation_id =
-          ${installationId}
+            ${installationId}
 
         ORDER BY
           event_occurred_at
@@ -321,36 +363,48 @@ export async function POST(
       `;
 
 
-    const allowed =
-      allowedPriceIds();
+    const prices =
+      paddlePrices();
 
 
-    /*
-     * Ignore subscriptions for any other Paddle price.
-     */
     const row =
       subscriptions.find(
         subscription =>
-          allowed.has(
+          prices.allowed.has(
             subscription.price_id
           )
       );
 
 
     if (!row) {
-      return Response.json(
-        {
-          entitled: false,
-          status:
-            'not_found'
-        },
-        {
-          headers: {
-            'Cache-Control':
-              'no-store'
-          }
-        }
-      );
+      return noStore({
+        entitled:
+          false,
+
+        hasSubscription:
+          false,
+
+        status:
+          'not_found',
+
+        plan:
+          null,
+
+        priceId:
+          null,
+
+        productId:
+          null,
+
+        currentPeriodStart:
+          null,
+
+        currentPeriodEnd:
+          null,
+
+        scheduledChange:
+          null
+      });
     }
 
 
@@ -381,30 +435,41 @@ export async function POST(
       periodValid;
 
 
-    return Response.json(
-      {
-        entitled:
-          grantsAccess,
+    const plan =
+      row.price_id ===
+        prices.monthly
+        ? 'monthly'
+        : 'annual';
 
-        status:
-          row.status,
 
-        priceId:
-          row.price_id,
+    return noStore({
+      entitled:
+        grantsAccess,
 
-        productId:
-          row.product_id,
+      hasSubscription:
+        true,
 
-        currentPeriodEnd:
-          row.current_period_end
-      },
-      {
-        headers: {
-          'Cache-Control':
-            'no-store'
-        }
-      }
-    );
+      status:
+        row.status,
+
+      plan,
+
+      priceId:
+        row.price_id,
+
+      productId:
+        row.product_id,
+
+      currentPeriodStart:
+        row.current_period_start,
+
+      currentPeriodEnd:
+        row.current_period_end,
+
+      scheduledChange:
+        row.scheduled_change ??
+        null
+    });
 
   } catch (error) {
     console.error(
@@ -415,18 +480,12 @@ export async function POST(
     );
 
 
-    return Response.json(
+    return noStore(
       {
         error:
           'Unable to check entitlement.'
       },
-      {
-        status: 500,
-        headers: {
-          'Cache-Control':
-            'no-store'
-        }
-      }
+      500
     );
   }
 }

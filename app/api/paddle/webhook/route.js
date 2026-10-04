@@ -17,8 +17,14 @@ export const runtime =
 const SUPPORTED_EVENTS =
   new Set([
     'transaction.completed',
+
     'subscription.created',
+    'subscription.activated',
+    'subscription.trialing',
     'subscription.updated',
+    'subscription.past_due',
+    'subscription.paused',
+    'subscription.resumed',
     'subscription.canceled'
   ]);
 
@@ -77,46 +83,46 @@ function validInstallationId(
 
 
 function allowedPriceIds() {
-  const ids =
-    [
-      process.env
-        .NEXT_PUBLIC_PADDLE_MONTHLY_PRICE_ID,
+  const monthly =
+    process.env
+      .NEXT_PUBLIC_PADDLE_MONTHLY_PRICE_ID;
 
-      process.env
-        .NEXT_PUBLIC_PADDLE_ANNUAL_PRICE_ID
-    ]
-      .filter(
-        value =>
-          /^pri_[a-z0-9]+$/i
-            .test(
-              String(
-                value || ''
-              )
-            )
-      );
+
+  const annual =
+    process.env
+      .NEXT_PUBLIC_PADDLE_ANNUAL_PRICE_ID;
 
 
   if (
-    ids.length !== 2
+    !/^pri_[a-z0-9]+$/i
+      .test(
+        String(
+          monthly || ''
+        )
+      ) ||
+    !/^pri_[a-z0-9]+$/i
+      .test(
+        String(
+          annual || ''
+        )
+      )
   ) {
-    throw new Error(
+    throw Error(
       'LaunchGuard Paddle prices are not configured.'
     );
   }
 
 
-  return new Set(ids);
+  return new Set([
+    monthly,
+    annual
+  ]);
 }
 
 
 function entitlementForStatus(
   status
 ) {
-  /*
-   * Strict access policy.
-   *
-   * No Pro while past_due.
-   */
   return (
     status === 'active' ||
     status === 'trialing'
@@ -159,7 +165,8 @@ export async function POST(
 
 
   /*
-   * Signature verification needs the exact raw body.
+   * Paddle signature verification requires
+   * exact raw request body.
    */
   const rawBody =
     await request.text();
@@ -206,19 +213,27 @@ export async function POST(
   ) {
     return Response.json({
       ok: true,
+
       ignored: true,
+
       eventType:
         event.eventType
     });
   }
 
 
+  /*
+   * Transaction completion is useful confirmation,
+   * but subscription events remain the entitlement
+   * source of truth.
+   */
   if (
     event.eventType ===
       'transaction.completed'
   ) {
     return Response.json({
       ok: true,
+
       eventType:
         event.eventType
     });
@@ -241,17 +256,14 @@ export async function POST(
       : [];
 
 
-  /*
-   * Only LaunchGuard Pro's configured monthly/annual
-   * Paddle prices are allowed to grant entitlement.
-   */
   const matchedItem =
     items.find(
       item =>
         allowedPrices.has(
           item?.price?.id
         )
-    ) || null;
+    ) ||
+    null;
 
 
   const priceId =
@@ -270,7 +282,7 @@ export async function POST(
     );
 
 
-  const requestedInstallationId =
+  const customInstallationId =
     stringOrNull(
       subscription
         .customData
@@ -278,11 +290,11 @@ export async function POST(
     );
 
 
-  const installationId =
+  let installationId =
     validInstallationId(
-      requestedInstallationId
+      customInstallationId
     )
-      ? requestedInstallationId
+      ? customInstallationId
       : null;
 
 
@@ -332,11 +344,42 @@ export async function POST(
 
 
     /*
-     * Paddle custom data alone is NOT enough.
-     *
-     * The installation must have registered its private
-     * secret with our backend before checkout.
+     * If a later Paddle event omits customData,
+     * preserve the already-bound installation.
      */
+    if (!installationId) {
+      const existing =
+        await sql`
+          SELECT
+            installation_id
+
+          FROM
+            paddle_subscriptions
+
+          WHERE
+            subscription_id =
+              ${subscription.id}
+
+          LIMIT 1
+        `;
+
+
+      const previousId =
+        existing[0]
+          ?.installation_id;
+
+
+      if (
+        validInstallationId(
+          previousId
+        )
+      ) {
+        installationId =
+          previousId;
+      }
+    }
+
+
     let registered =
       false;
 
@@ -354,7 +397,7 @@ export async function POST(
 
           WHERE
             installation_id =
-            ${installationId}
+              ${installationId}
 
           LIMIT 1
         `;
@@ -406,16 +449,20 @@ export async function POST(
         ${installationId},
         ${periodStart},
         ${periodEnd},
+
         CAST(
           ${scheduledChangeJson}
           AS jsonb
         ),
+
         CAST(
           ${customDataJson}
           AS jsonb
         ),
+
         ${event.eventId},
         ${occurredAt},
+
         NOW()
       )
 
@@ -424,6 +471,7 @@ export async function POST(
       )
 
       DO UPDATE SET
+
         customer_id =
           EXCLUDED.customer_id,
 
@@ -434,41 +482,46 @@ export async function POST(
           EXCLUDED.entitled,
 
         price_id =
-          EXCLUDED.price_id,
+          COALESCE(
+            EXCLUDED.price_id,
+            paddle_subscriptions.price_id
+          ),
 
         product_id =
-          EXCLUDED.product_id,
+          COALESCE(
+            EXCLUDED.product_id,
+            paddle_subscriptions.product_id
+          ),
 
         installation_id =
           COALESCE(
             EXCLUDED.installation_id,
-            paddle_subscriptions
-              .installation_id
+            paddle_subscriptions.installation_id
           ),
 
         current_period_start =
-          EXCLUDED
-            .current_period_start,
+          COALESCE(
+            EXCLUDED.current_period_start,
+            paddle_subscriptions.current_period_start
+          ),
 
         current_period_end =
-          EXCLUDED
-            .current_period_end,
+          COALESCE(
+            EXCLUDED.current_period_end,
+            paddle_subscriptions.current_period_end
+          ),
 
         scheduled_change =
-          EXCLUDED
-            .scheduled_change,
+          EXCLUDED.scheduled_change,
 
         custom_data =
-          EXCLUDED
-            .custom_data,
+          EXCLUDED.custom_data,
 
         last_event_id =
-          EXCLUDED
-            .last_event_id,
+          EXCLUDED.last_event_id,
 
         event_occurred_at =
-          EXCLUDED
-            .event_occurred_at,
+          EXCLUDED.event_occurred_at,
 
         updated_at =
           NOW()
